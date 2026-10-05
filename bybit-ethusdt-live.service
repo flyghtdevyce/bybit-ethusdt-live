@@ -1,5 +1,5 @@
 [Unit]
-Description=Bybit ETHUSDT Frozen-v3 Live Trading Service
+Description=Bybit ETHUSDT Strategy Lab V6.1 Live Trading Service
 After=network-online.target
 Wants=network-online.target
 

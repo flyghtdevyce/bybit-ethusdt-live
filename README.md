@@ -1,45 +1,48 @@
-# Bybit ETHUSDT Frozen-v3 Live Bot
+# Bybit ETHUSDT Strategy Lab V6.1 Live Bot
 
-Standalone repository and systemd service for Bybit Linear ETHUSDT on closed 60-minute candles. This repository contains its own signal engine; it does not import from or deploy the paper bot.
+Standalone repository and systemd service for real Bybit Linear ETHUSDT orders on closed 60-minute candles. Long and short trades are enabled. The strategy core is self-contained and mirrors the local V6.1 paper bot.
 
 ## Strategy settings
 
 | Setting | Value |
 |---|---:|
 | EMA fast / slow | 5 / 30 |
-| RSI period and cross thresholds | 14; long 30, short 70 |
+| RSI period and long / short thresholds | 14; 30 / 70 |
 | Signal window | 5 candles |
 | ATR period / initial stop | 14 / 0.5 ATR |
 | Risk budget | 2.5% of current Bybit Unified equity |
 | Breakout buffer | 1% |
-| Trail | activate at +2R, trail by 2.25 ATR |
-| Fees / slippage model | 0.055% / 0.02% per side (backtest settings; live exchange fills are actual) |
+| Trail | activate at +2R, trail by 2.25 SMA-ATR |
+| Fee / slippage sizing estimate | 0.055% / 0.02% per side |
+| Directions | LONG and SHORT enabled |
 
-Entry uses a conditional market order with an attached exchange stop. Position quantity is rounded to Bybit's instrument step and capped by available margin. After +2R, the bot tightens the exchange stop using the 2.25 ATR trail. EMA reversal submits a reduce-only market close. The bot halts on unclear order/position state or a missed hourly candle instead of guessing.
+EMA 5/30 and matching SMA-RSI(14) threshold crossovers can happen in either order within five candles; the second cross creates a setup. Only the next candle may confirm it by breaking the signal candle high/low. After confirmation closes, a buffered conditional market order is placed at the confirmation candle high/low, with an exchange stop attached at 0.5 SMA-ATR(14) from the trigger. Opposite signals cancel unfilled bot entries. One-way mode and one position at a time are required.
 
-## Before live activation
+Quantity uses 2.5% of current Unified equity as the risk budget, including estimated entry/stop fees and slippage, then rounds down to Bybit's quantity step and caps notional to 90% of available margin at configured leverage. Exchange fills, fees and slippage will differ from the replay assumptions. The $10,000 backtest start is not used for live sizing. After price reaches +2R, the stop is tightened using the closed candle and 2.25 SMA-ATR. Stop orders are managed at the exchange; EMA reversal submits a reduce-only market close as soon as the closed-candle reversal is detected (typically shortly after the next candle opens, with polling/fill deviation). The bot halts on unclear order/position state or a missed hourly candle instead of guessing.
 
-The signal/indicator functions were bundled from the local paper implementation so this repository is self-contained. The original deployed `bot_frozen_v3.py` and the historical trade CSV are not available here, so exact source parity and reproduction of the screenshot's backtest metrics have not been verified. Review and compare those before enabling orders.
+The signal and indicator rules mirror the local V6.1 paper implementation, including first-close EMA seed, SMA-RSI, SMA-ATR, crossover order/window, next-candle confirmation, signal-candle ATR stop, opposite-signal cancellation and close-based ATR trail. The replay still differs from the Strategy Lab screenshot, so exact parity with the website's full implementation is not established. Compare exported Strategy Lab trades before treating replay performance as reproduced.
 
-The screenshot's $10,000 is a backtest starting balance. Live position risk is calculated from current Bybit Unified account equity. This is an automated trading system; test the service on a demo account first.
+## Credentials and activation
 
-## VPS setup
+Create a Bybit HMAC API key for read and derivatives trading access, restrict it to the VPS IP, and leave withdrawal/transfer permissions disabled. Store it only in `/etc/bybit/ethusdt-live.env`, owned by `root:trader` with mode `0640`. Never commit credentials or put the Bybit key in GitHub Actions. The example environment file defaults `LIVE_TRADING_ENABLED=NO`.
 
-The deployment workflow expects an Ubuntu VPS with `python3`, `rsync`, and `sudo`; SSH access for the selected deploy user; and `/home/trader` writable by that user. The deploy user must be allowed to install the systemd unit and control this one service with non-interactive sudo. Create the `trader` account if needed and make it owner of `/home/trader/bybit-ethusdt-live/data`.
+The live executor exits unless the protected VPS environment has the exact setting `LIVE_TRADING_ENABLED=YES`. Keep it `NO` while installing, reviewing, and testing. Starting balance $10,000 is only for historical replay; live sizing uses current account equity.
 
-1. Create `/etc/bybit/ethusdt-live.env` on the VPS using `ethusdt-live.env.example` as a template. Set owner `root:trader`, mode `0640`. Keep `LIVE_TRADING_ENABLED=NO` initially. The actual Bybit key and secret belong only in this VPS file.
-2. Use a Bybit HMAC key limited to read and derivatives trading, restrict it to the VPS IP, and disable withdrawals/transfers.
-3. Add GitHub Actions repository secrets: `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY` (private deploy key), and `VPS_KNOWN_HOSTS` (pinned host key line). Do not add Bybit keys to GitHub.
-4. Push to `main` or run **Test and deploy live bot** manually. The workflow runs unit tests and deploys this repository alone. It installs the service but leaves it stopped unless the VPS env file contains the exact line `LIVE_TRADING_ENABLED=YES`.
-5. After verifying code, configuration, account mode (one-way), exchange key permissions, and demo behavior, change the VPS flag deliberately and run the deployment workflow again. Inspect with `sudo systemctl status bybit-ethusdt-live` and `sudo journalctl -u bybit-ethusdt-live -f`.
+## VPS deployment
 
-The workflow's SSH deploy user needs non-interactive sudo for the systemd install/reload/service commands. Restrict that sudo policy to the required commands on the VPS.
+The GitHub Actions workflow deploys this separate repository to `/home/trader/bybit-ethusdt-live`. It expects Ubuntu with `python3`, `rsync`, and `sudo`; the deploy user needs narrowly scoped non-interactive sudo for installing/reloading the systemd unit and managing this service.
+
+1. On the VPS, create `/etc/bybit/ethusdt-live.env` from `ethusdt-live.env.example`, set `LIVE_TRADING_ENABLED=NO`, and install with owner `root:trader`, mode `0640`.
+2. Add GitHub Actions secrets `VPS_HOST`, `VPS_USER`, `VPS_SSH_KEY`, and `VPS_KNOWN_HOSTS`. These are deployment SSH details only.
+3. Push this repository to `main` or run **Test and deploy live bot** manually. The workflow deploys the code and leaves the unit stopped unless the VPS flag is already `YES`.
+4. The current code defaults to Bybit mainnet. For a Demo Trading shakeout, set `BYBIT_API_URL=https://api-demo.bybit.com` and use a separate Demo API key. Bybit documents this endpoint for its isolated Demo Trading account. Do not use a mainnet key for that test. The executor remains stopped unless `LIVE_TRADING_ENABLED=YES`.
+5. Inspect using `sudo systemctl status bybit-ethusdt-live` and `sudo journalctl -u bybit-ethusdt-live -f`.
 
 ## Local checks
 
 ```sh
 python3 -m unittest discover -s tests -v
-python3 live_bot.py --once --config live_config.json
+python3 -m py_compile strategy_core.py live_bot.py
 ```
 
-`--once` still requires `LIVE_TRADING_ENABLED=YES` because it uses the live executor. Do not use it as a dry run. There is no order-placement dry-run flag in this live service.
+Tests use mocked exchange calls and do not submit orders. `live_bot.py --once` is not a dry run; the live executor remains disabled unless the explicit environment flag is set.

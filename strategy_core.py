@@ -1,5 +1,6 @@
 """Standalone 60m signal engine bundled with the live repository."""
 from __future__ import annotations
+import math
 import json
 import logging
 import sqlite3
@@ -80,12 +81,13 @@ def get_closed_candles(cfg: Config, limit: int = 1000) -> list[Candle]:
 
 def ema(values: list[float], period: int) -> list[float | None]:
     result: list[float | None] = [None] * len(values)
-    if len(values) < period:
+    if not values:
         return result
     alpha = 2.0 / (period + 1)
-    current = sum(values[:period]) / period
-    result[period - 1] = current
-    for i in range(period, len(values)):
+    # Same first-close seed as the paper Strategy Lab replay.
+    current = values[0]
+    result[0] = current
+    for i in range(1, len(values)):
         current = alpha * values[i] + (1 - alpha) * current
         result[i] = current
     return result
@@ -102,25 +104,20 @@ def sma_rsi(values: list[float], period: int) -> list[float | None]:
     return out
 
 
-def atr_wilder(candles: list[Candle], period: int) -> list[float | None]:
+def atr_sma(candles: list[Candle], period: int) -> list[float | None]:
     out: list[float | None] = [None] * len(candles)
     tr: list[float] = []
     for i, c in enumerate(candles):
         tr.append(c.high - c.low if i == 0 else max(c.high - c.low, abs(c.high - candles[i-1].close), abs(c.low - candles[i-1].close)))
-    if len(tr) < period:
-        return out
-    value = sum(tr[:period]) / period
-    out[period - 1] = value
-    for i in range(period, len(tr)):
-        value = ((period - 1) * value + tr[i]) / period
-        out[i] = value
+    for i in range(period - 1, len(tr)):
+        out[i] = sum(tr[i-period+1:i+1]) / period
     return out
 
 
 def indicators(candles: list[Candle], cfg: Config) -> dict[str, list[float | None]]:
     closes = [c.close for c in candles]
     return {"ema_fast": ema(closes, cfg.ema_fast), "ema_slow": ema(closes, cfg.ema_slow),
-            "rsi": sma_rsi(closes, cfg.rsi_period), "atr": atr_wilder(candles, cfg.atr_period)}
+            "rsi": sma_rsi(closes, cfg.rsi_period), "atr": atr_sma(candles, cfg.atr_period)}
 
 
 
@@ -200,9 +197,39 @@ def new_signal(i: int, candles: list[Candle], ind: dict[str, list[float | None]]
     ef, es, rsi = ind["ema_fast"], ind["ema_slow"], ind["rsi"]
     if any(x is None for x in (ef[i], es[i], rsi[i], rsi[i-1])):
         return None
-    if cfg.allow_long and ef[i] > es[i] and rsi[i-1] <= cfg.rsi_long_cross < rsi[i]:
+    ema_up = ef[i-1] <= es[i-1] and ef[i] > es[i]
+    ema_down = ef[i-1] >= es[i-1] and ef[i] < es[i]
+    rsi_up = rsi[i-1] <= cfg.rsi_long_cross < rsi[i]
+    rsi_down = rsi[i-1] >= cfg.rsi_short_cross > rsi[i]
+    first = max(1, i - cfg.signal_window_bars + 1)
+    ema_up_window = ema_down_window = rsi_up_window = rsi_down_window = False
+    for j in range(first, i + 1):
+        if any(ind[k][j] is None or ind[k][j-1] is None for k in ("ema_fast", "ema_slow", "rsi")):
+            continue
+        ema_up_window |= ind["ema_fast"][j-1] <= ind["ema_slow"][j-1] and ind["ema_fast"][j] > ind["ema_slow"][j]
+        ema_down_window |= ind["ema_fast"][j-1] >= ind["ema_slow"][j-1] and ind["ema_fast"][j] < ind["ema_slow"][j]
+        rsi_up_window |= ind["rsi"][j-1] <= cfg.rsi_long_cross < ind["rsi"][j]
+        rsi_down_window |= ind["rsi"][j-1] >= cfg.rsi_short_cross > ind["rsi"][j]
+    # The second matching crossover event creates the signal; either can occur first.
+    if cfg.allow_long and (ema_up or rsi_up) and ema_up_window and rsi_up_window and ef[i] > es[i]:
         return "LONG"
-    if cfg.allow_short and ef[i] < es[i] and rsi[i-1] >= cfg.rsi_short_cross > rsi[i]:
+    if cfg.allow_short and (ema_down or rsi_down) and ema_down_window and rsi_down_window and ef[i] < es[i]:
         return "SHORT"
     return None
 
+
+def confirm_waiting_signal(waiting: dict[str, Any], candle: Candle, signal_atr: float,
+                           cfg: Config) -> dict[str, Any] | None:
+    """Confirm only the next candle, then return the buffered stop-entry setup."""
+    if not math.isfinite(signal_atr) or signal_atr <= 0:
+        return None
+    if waiting["side"] == "LONG":
+        if candle.high < float(waiting["signal_high"]):
+            return None
+        trigger = candle.high * (1 + cfg.breakout_buffer_pct / 100)
+    else:
+        if candle.low > float(waiting["signal_low"]):
+            return None
+        trigger = candle.low * (1 - cfg.breakout_buffer_pct / 100)
+    return {"side":waiting["side"], "trigger":trigger, "signal_atr":signal_atr,
+            "signal_ms":int(waiting["signal_ms"]), "confirmation_ms":candle.start_ms}

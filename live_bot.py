@@ -19,13 +19,13 @@ from pathlib import Path
 from typing import Any
 
 from strategy_core import (
-    Config, Candle, INTERVAL_MS, bootstrap, event, get_closed_candles,
+    Config, Candle, INTERVAL_MS, bootstrap, confirm_waiting_signal, event, get_closed_candles,
     get_state, indicators, init_db, new_signal, set_state,
 )
 
-API = "https://api.bybit.com"
+API = os.getenv("BYBIT_API_URL", "https://api.bybit.com").rstrip("/")
 WINDOW = "5000"
-PREFIX = "ethf3"
+PREFIX = "ethv61"
 
 
 class BybitAPI:
@@ -145,12 +145,18 @@ class LiveRunner:
         self.qty_filter = self.spec["lotSizeFilter"]
         self.price_tick = self.spec["priceFilter"]["tickSize"]
 
-    def qty_for_risk(self, trigger: float, atr: float, available: float) -> tuple[str, float]:
+    def qty_for_risk(self, side: str, trigger: float, atr: float, available: float) -> tuple[str, float]:
         stop_distance = atr * self.cfg.atr_stop_multiple
         if stop_distance <= 0:
             raise RuntimeError("Invalid stop distance.")
         equity, _ = self.api.account()
-        qty_by_risk = equity * self.cfg.risk_per_trade_pct / 100 / stop_distance
+        # Include estimated entry and stop fees/slippage in the risk budget,
+        # matching the paper sizing convention. The exchange remains the source
+        # of truth for actual fills and fees.
+        fee_slip = (self.cfg.fee_per_side_pct + self.cfg.slippage_per_side_pct) / 100
+        stop_price = trigger - stop_distance if side == "LONG" else trigger + stop_distance
+        unit_risk = stop_distance + (trigger + stop_price) * fee_slip
+        qty_by_risk = equity * self.cfg.risk_per_trade_pct / 100 / unit_risk
         leverage_rows = self.api.positions()
         leverage_values = [float(r["leverage"]) for r in leverage_rows if r.get("leverage")]
         if not leverage_values:
@@ -166,7 +172,7 @@ class LiveRunner:
             raise RuntimeError("Calculated order is below Bybit's minNotionalValue; signal skipped.")
         return qty_text, stop_distance
 
-    def submit_signal(self, side: str, candle: Candle, atr: float) -> None:
+    def submit_signal(self, side: str, candle: Candle, atr: float, signal_ms: int) -> None:
         equity, available = self.api.account()
         del equity
         is_long = side == "LONG"
@@ -175,11 +181,11 @@ class LiveRunner:
         stop_distance = atr * self.cfg.atr_stop_multiple
         raw_stop = trigger - stop_distance if is_long else trigger + stop_distance
         stop = float(round_to_step(raw_stop, self.price_tick, up=not is_long))
-        qty, _ = self.qty_for_risk(trigger, atr, available)
+        qty, _ = self.qty_for_risk(side, trigger, atr, available)
         order_link = f"{PREFIX}-{side.lower()}-{candle.start_ms}"
         result = self.api.place_breakout(side, qty, f"{trigger:.12g}", f"{stop:.12g}", order_link)
-        pending = {"side":side,"trigger":trigger,"signal_atr":atr,"signal_ms":candle.start_ms,
-                   "expires_after_ms":candle.start_ms+self.cfg.signal_window_bars*INTERVAL_MS,
+        pending = {"side":side,"trigger":trigger,"signal_atr":atr,"signal_ms":signal_ms,
+                   "confirmation_ms":candle.start_ms,
                    "order_id":result.get("orderId"),"order_link_id":order_link,"stop":stop,"qty":qty}
         set_state(self.db,"pending",pending)
         event(self.db,"LIVE_ENTRY_ORDER",f"{side} conditional market entry qty={qty} trigger={trigger}; initial exchange stop={stop}",candle.start_ms+INTERVAL_MS)
@@ -193,9 +199,10 @@ class LiveRunner:
         if tracked is None:
             if not pending:
                 raise RuntimeError("Untracked ETHUSDT position found; manual intervention required.")
+            initial_stop=float(position.get("stopLoss") or pending["stop"])
             tracked = {"side":side,"entry_price":entry,"quantity":qty,
-                       "initial_risk":float(pending["signal_atr"])*self.cfg.atr_stop_multiple,
-                       "stop":float(position.get("stopLoss") or pending["stop"]),"order_link_id":pending.get("order_link_id")}
+                       "initial_risk":abs(entry-initial_stop),
+                       "stop":initial_stop,"order_link_id":pending.get("order_link_id")}
             set_state(self.db,"position",tracked)
             set_state(self.db,"pending",None)
             event(self.db,"LIVE_POSITION_RECONCILED",f"Exchange confirms {side} position at {entry}; size={qty}",candle.start_ms+INTERVAL_MS)
@@ -221,7 +228,7 @@ class LiveRunner:
             return
         favorable = candle.high-entry if side=="LONG" else entry-candle.low
         if favorable >= tracked["initial_risk"]*self.cfg.trail_activation_r and ind["atr"][i] is not None:
-            raw = candle.high-self.cfg.trail_atr_multiple*float(ind["atr"][i]) if side=="LONG" else candle.low+self.cfg.trail_atr_multiple*float(ind["atr"][i])
+            raw = candle.close-self.cfg.trail_atr_multiple*float(ind["atr"][i]) if side=="LONG" else candle.close+self.cfg.trail_atr_multiple*float(ind["atr"][i])
             proposed = float(round_to_step(raw,self.price_tick,up=side=="SHORT"))
             tighter = proposed > exchange_stop if side=="LONG" else proposed < exchange_stop
             if tighter:
@@ -258,23 +265,39 @@ class LiveRunner:
         c=fresh[0]
         ind=indicators(candles,self.cfg)
         i=next(i for i,x in enumerate(candles) if x.start_ms==c.start_ms)
+        signal=new_signal(i,candles,ind,self.cfg)
         if positions:
             self.manage_position(positions,c,i,ind)
         else:
-            if pending and c.start_ms>pending["expires_after_ms"]:
-                self.api.cancel_order(str(pending["order_id"]))
-                set_state(self.db,"pending",None)
-                event(self.db,"LIVE_ENTRY_EXPIRED",f"Canceled {pending['side']} unfilled breakout order",c.start_ms+INTERVAL_MS)
-                pending=None
-            signal=new_signal(i,candles,ind,self.cfg)
+            waiting=get_state(self.db,"waiting_signal")
+
+            # A signal is confirmed only by the immediately following candle.
+            # Then the buffered stop order is staged at that confirmation bar's
+            # extreme, using ATR from the original signal bar.
+            if waiting:
+                if c.start_ms == int(waiting["signal_ms"]) + INTERVAL_MS:
+                    signal_i=next((j for j,x in enumerate(candles) if x.start_ms==int(waiting["signal_ms"])),None)
+                    signal_atr=None if signal_i is None else ind["atr"][signal_i]
+                    setup=None if signal_atr is None else confirm_waiting_signal(waiting,c,float(signal_atr),self.cfg)
+                    if setup:
+                        self.submit_signal(setup["side"],c,setup["signal_atr"],setup["signal_ms"])
+                set_state(self.db,"waiting_signal",None)
+                waiting=None
+
             if signal:
-                if pending:
+                pending=get_state(self.db,"pending")
+                if pending and signal != pending["side"]:
                     self.api.cancel_order(str(pending["order_id"]))
-                    event(self.db,"LIVE_ENTRY_CANCELLED",f"New {signal} signal canceled prior {pending['side']} order",c.start_ms+INTERVAL_MS)
+                    event(self.db,"LIVE_ENTRY_CANCELLED",f"Opposite {signal} signal canceled prior {pending['side']} stop order",c.start_ms+INTERVAL_MS)
                     set_state(self.db,"pending",None)
                     pending=None
-                if ind["atr"][i] is not None:
-                    self.submit_signal(signal,c,float(ind["atr"][i]))
+                if waiting and signal != waiting["side"]:
+                    event(self.db,"LIVE_SIGNAL_REPLACED",f"Opposite {signal} signal replaced waiting {waiting['side']} setup",c.start_ms+INTERVAL_MS)
+                    waiting=None
+                if pending is None and waiting is None:
+                    waiting={"side":signal,"signal_ms":c.start_ms,"signal_high":c.high,"signal_low":c.low}
+                    set_state(self.db,"waiting_signal",waiting)
+                    event(self.db,"LIVE_SIGNAL",f"{signal}; waiting for next-candle confirmation",c.start_ms+INTERVAL_MS)
         set_state(self.db,"last_processed_ms",c.start_ms)
 
 
