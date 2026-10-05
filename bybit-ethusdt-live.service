@@ -1,0 +1,20 @@
+[Unit]
+Description=Bybit ETHUSDT Frozen-v3 Live Trading Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=trader
+WorkingDirectory=/home/trader/bybit-ethusdt-live
+EnvironmentFile=/etc/bybit/ethusdt-live.env
+ExecStart=/usr/bin/python3 /home/trader/bybit-ethusdt-live/live_bot.py --config /home/trader/bybit-ethusdt-live/live_config.json
+Restart=on-failure
+RestartSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/home/trader/bybit-ethusdt-live/data
+
+[Install]
+WantedBy=multi-user.target
