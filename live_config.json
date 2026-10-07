@@ -13,7 +13,7 @@
   "atr_stop_multiple": 0.5,
   "risk_per_trade_pct": 2.5,
   "breakout_buffer_pct": 1.0,
-  "fee_per_side_pct": 0.055,
+  "fee_per_side_pct": 0.10,
   "slippage_per_side_pct": 0.02,
   "starting_balance_usd": 10000.0,
   "trail_activation_r": 2.0,
