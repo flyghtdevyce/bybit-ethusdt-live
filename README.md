@@ -13,7 +13,7 @@ Standalone repository and systemd service for real Bybit Linear ETHUSDT orders o
 | Risk budget | 2.5% of current Bybit Unified equity |
 | Breakout buffer | 1% |
 | Trail | activate at +2R, trail by 2.25 SMA-ATR |
-| Fee / slippage sizing estimate | 0.055% / 0.02% per side |
+| Fee / slippage sizing estimate | 0.1% / 0.02% per side |
 | Directions | LONG and SHORT enabled |
 
 EMA 5/30 and matching SMA-RSI(14) threshold crossovers can happen in either order within five candles; the second cross creates a setup. Only the next candle may confirm it by breaking the signal candle high/low. After confirmation closes, a buffered conditional market order is placed at the confirmation candle high/low, with an exchange stop attached at 0.5 SMA-ATR(14) from the trigger. Opposite signals cancel unfilled bot entries. One-way mode and one position at a time are required.
