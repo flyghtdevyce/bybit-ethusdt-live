@@ -9,6 +9,7 @@ class StrategyTests(unittest.TestCase):
         cfg = Config.load(str(Path(__file__).resolve().parents[1] / "live_config.json"))
         self.assertEqual((cfg.symbol, cfg.interval, cfg.ema_fast, cfg.ema_slow), ("ETHUSDT", "60", 5, 30))
         self.assertEqual((cfg.risk_per_trade_pct, cfg.trail_activation_r, cfg.trail_atr_multiple), (2.5, 2.0, 2.25))
+        self.assertEqual(cfg.database_path, "data/live_mainnet.sqlite3")
 
     def test_signal_requires_cross_and_trend(self):
         candles = [Candle(i, 1, 1, 1, 1, 0) for i in range(3)]
