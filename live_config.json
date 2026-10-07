@@ -20,5 +20,5 @@
   "trail_atr_multiple": 2.25,
   "allow_long": true,
   "allow_short": true,
-  "database_path": "data/live.sqlite3"
+  "database_path": "data/live_mainnet.sqlite3"
 }

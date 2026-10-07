@@ -11,6 +11,7 @@ import hmac
 import json
 import logging
 import os
+import subprocess
 import time
 import urllib.parse
 import urllib.request
@@ -73,6 +74,12 @@ class BybitAPI:
     def open_orders(self) -> list[dict[str, Any]]:
         return self.request("GET", "/v5/order/realtime", {"category":"linear","symbol":"ETHUSDT"}).get("list", [])
 
+    def last_price(self) -> float:
+        rows = self.request("GET", "/v5/market/tickers", {"category":"linear","symbol":"ETHUSDT"}).get("list", [])
+        if not rows or float(rows[0].get("lastPrice") or 0) <= 0:
+            raise RuntimeError("Bybit returned no valid ETHUSDT last price.")
+        return float(rows[0]["lastPrice"])
+
     def account(self) -> tuple[float, float]:
         result = self.request("GET", "/v5/account/wallet-balance", {"accountType":"UNIFIED","coin":"USDT"})
         accounts = result.get("list", [])
@@ -101,6 +108,16 @@ class BybitAPI:
             "orderType":"Market", "qty":qty,
             "triggerPrice":trigger, "triggerDirection":1 if is_long else 2,
             "triggerBy":"LastPrice", "timeInForce":"GTC", "positionIdx":0,
+            "orderLinkId":order_link_id, "reduceOnly":False,
+            "stopLoss":stop, "slTriggerBy":"LastPrice", "tpslMode":"Full", "slOrderType":"Market",
+        }
+        return self.request("POST", "/v5/order/create", body)
+
+    def place_market_entry(self, side: str, qty: str, stop: str, order_link_id: str) -> dict[str, Any]:
+        is_long = side == "LONG"
+        body = {
+            "category":"linear", "symbol":"ETHUSDT", "side":"Buy" if is_long else "Sell",
+            "orderType":"Market", "qty":qty, "positionIdx":0,
             "orderLinkId":order_link_id, "reduceOnly":False,
             "stopLoss":stop, "slTriggerBy":"LastPrice", "tpslMode":"Full", "slOrderType":"Market",
         }
@@ -137,6 +154,18 @@ def active_position(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
     return live[0]
 
 
+def live_service_is_active() -> bool:
+    """Avoid two processes racing over the live bot's exchange and SQLite state."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "is-active", "bybit-ethusdt-live.service"],
+            check=False, capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+    return result.stdout.strip() == "active"
+
+
 class LiveRunner:
     def __init__(self, cfg: Config, api: BybitAPI):
         self.cfg, self.api = cfg, api
@@ -145,11 +174,13 @@ class LiveRunner:
         self.qty_filter = self.spec["lotSizeFilter"]
         self.price_tick = self.spec["priceFilter"]["tickSize"]
 
-    def qty_for_risk(self, side: str, trigger: float, atr: float, available: float) -> tuple[str, float]:
+    def qty_for_risk(self, side: str, trigger: float, atr: float, available: float,
+                     equity: float | None = None) -> tuple[str, float]:
         stop_distance = atr * self.cfg.atr_stop_multiple
         if stop_distance <= 0:
             raise RuntimeError("Invalid stop distance.")
-        equity, _ = self.api.account()
+        if equity is None:
+            equity, _ = self.api.account()
         # Include estimated entry and stop fees/slippage in the risk budget,
         # matching the paper sizing convention. The exchange remains the source
         # of truth for actual fills and fees.
@@ -171,6 +202,138 @@ class LiveRunner:
         if notional < float(self.qty_filter.get("minNotionalValue") or 0):
             raise RuntimeError("Calculated order is below Bybit's minNotionalValue; signal skipped.")
         return qty_text, stop_distance
+
+    def force_entry(self, side: str) -> None:
+        """Open a confirmed, manually forced market entry using V6.1 risk sizing."""
+        side = side.upper()
+        if side not in ("LONG", "SHORT"):
+            raise ValueError("Force-entry side must be LONG or SHORT.")
+        if side == "LONG" and not self.cfg.allow_long:
+            raise RuntimeError("Long entries are disabled in the strategy config.")
+        if side == "SHORT" and not self.cfg.allow_short:
+            raise RuntimeError("Short entries are disabled in the strategy config.")
+
+        positions = self.api.positions()
+        active = active_position(positions)
+        mode_indices = {int(p["positionIdx"]) for p in positions if "positionIdx" in p}
+        if mode_indices and mode_indices != {0}:
+            raise RuntimeError("Account is not in One-Way Mode; no forced order submitted.")
+        if active:
+            raise RuntimeError("ETHUSDT position already exists; no forced order submitted.")
+        if self.api.open_orders():
+            raise RuntimeError("ETHUSDT has an open order; no forced order submitted.")
+        for state_key in ("pending", "position", "waiting_signal"):
+            if get_state(self.db, state_key) is not None:
+                raise RuntimeError(f"Local bot state '{state_key}' is not empty; reconcile before forcing an entry.")
+
+        candles = get_closed_candles(self.cfg)
+        if not candles:
+            raise RuntimeError("No closed H1 candles available; cannot calculate ATR.")
+        bootstrap(self.db, candles)
+        candle = candles[-1]
+        ind = indicators(candles, self.cfg)
+        atr = ind["atr"][-1]
+        if atr is None or atr <= 0:
+            raise RuntimeError("Latest closed candle has no valid ATR; no forced order submitted.")
+
+        reference = self.api.last_price()
+        equity, available = self.api.account()
+        is_long = side == "LONG"
+        raw_stop_distance = float(atr) * self.cfg.atr_stop_multiple
+        raw_stop = reference - raw_stop_distance if is_long else reference + raw_stop_distance
+        stop = float(round_to_step(raw_stop, self.price_tick, up=not is_long))
+        stop_distance = abs(reference - stop)
+        sizing_atr = stop_distance / self.cfg.atr_stop_multiple
+        qty, _ = self.qty_for_risk(side, reference, sizing_atr, available, equity=equity)
+        order_link = f"{PREFIX}-force-{side.lower()}-{int(time.time() * 1000)}"
+        risk_budget = equity * self.cfg.risk_per_trade_pct / 100
+        fee_slip = (self.cfg.fee_per_side_pct + self.cfg.slippage_per_side_pct) / 100
+        estimated_risk = float(qty) * (abs(reference - stop) + (reference + stop) * fee_slip)
+
+        print(f"FORCED V6.1 MARKET ENTRY: {side} ETHUSDT")
+        print(f"Reference last price: {reference:.8g}; latest closed H1 ATR: {float(atr):.8g}")
+        print(f"Quantity: {qty} ETH; estimated stop: {stop:.8g}; stop distance: {stop_distance:.8g}")
+        print(f"Live Unified equity: {equity:.2f} USDT; available margin: {available:.2f} USDT; "
+              f"risk budget: {risk_budget:.2f} USDT "
+              f"({self.cfg.risk_per_trade_pct:g}%); estimated risk incl. fee/slippage: {estimated_risk:.2f} USDT")
+        print("This bypasses signal/confirmation and sends a market order with an attached exchange stop.")
+        expected = f"FORCE LIVE ETHUSDT {side}"
+        confirmation = input(f"Type exactly: {expected}\n").strip()
+        if confirmation != expected:
+            event(self.db, "FORCE_ENTRY_CANCELLED", f"{side}; operator confirmation did not match; no order submitted.")
+            print("Cancelled; no order submitted.")
+            return
+
+        # Recheck exchange state immediately before the irreversible request.
+        if active_position(self.api.positions()) is not None or self.api.open_orders():
+            event(self.db, "FORCE_ENTRY_ABORTED", f"{side}; exchange position/order appeared before submission.")
+            raise RuntimeError("ETHUSDT exchange state changed; no forced order submitted.")
+
+        pending = {
+            "side":side, "trigger":reference, "signal_atr":float(atr),
+            "signal_ms":candle.start_ms, "confirmation_ms":candle.start_ms,
+            "order_id":None, "order_link_id":order_link, "stop":stop, "qty":qty,
+            "forced":True, "submission_state":"SUBMITTING", "reference_price":reference,
+        }
+        set_state(self.db, "pending", pending)
+        event(self.db, "FORCE_ENTRY_REQUESTED",
+              f"{side} market entry qty={qty}; reference={reference}; ATR={float(atr)}; "
+              f"stop={stop}; equity={equity:.2f}; available_margin={available:.2f}; risk_budget={risk_budget:.2f}; "
+              f"estimated_risk={estimated_risk:.2f}; orderLinkId={order_link}")
+        try:
+            result = self.api.place_market_entry(side, qty, f"{stop:.12g}", order_link)
+            order_id = result.get("orderId")
+            if not order_id:
+                raise RuntimeError("Bybit response did not include orderId.")
+        except Exception as exc:
+            pending["submission_state"] = "UNCONFIRMED"
+            set_state(self.db, "pending", pending)
+            error_text = str(exc).replace(self.api.key, "[REDACTED]")
+            secret_text = self.api.secret.decode(errors="ignore")
+            if secret_text:
+                error_text = error_text.replace(secret_text, "[REDACTED]")
+            event(self.db, "FORCE_ENTRY_SUBMISSION_UNCONFIRMED",
+                  f"{side} orderLinkId={order_link}; verify Bybit order/position history before retrying; error={error_text}")
+            raise RuntimeError("Order submission status is unclear; keep the bot stopped and inspect Bybit before retrying.") from exc
+
+        pending["order_id"] = order_id
+        pending["submission_state"] = "ACCEPTED"
+        set_state(self.db, "pending", pending)
+        event(self.db, "FORCE_ENTRY_ORDER_ACCEPTED",
+              f"{side} market order accepted; orderId={order_id}; orderLinkId={order_link}; "
+              f"qty={qty}; reference={reference}; stop={stop}")
+        print(f"Bybit accepted the forced market order. Order ID: {order_id}")
+
+        # Reconcile the fill now so the regular strategy service can manage it.
+        for _ in range(10):
+            position = active_position(self.api.positions())
+            if position:
+                actual_side = "LONG" if position.get("side") == "Buy" else "SHORT"
+                if actual_side != side:
+                    raise RuntimeError("Bybit position side does not match forced order; keep the strategy stopped.")
+                actual_entry = float(position["avgPrice"])
+                actual_stop = float(position.get("stopLoss") or stop)
+                if float(position.get("stopLoss") or 0) <= 0:
+                    self.api.set_stop(f"{stop:.12g}")
+                    event(self.db, "FORCE_ENTRY_STOP_RESTORED", f"Exchange position lacked stop; attached stop={stop}.")
+                    actual_stop = stop
+                tracked = {
+                    "side":side, "entry_price":actual_entry, "quantity":str(position["size"]),
+                    "initial_risk":abs(actual_entry - actual_stop), "stop":actual_stop,
+                    "order_link_id":order_link, "forced":True,
+                }
+                set_state(self.db, "position", tracked)
+                set_state(self.db, "pending", None)
+                event(self.db, "FORCED_POSITION_OPENED",
+                      f"{side} fill confirmed; avgPrice={actual_entry}; qty={position['size']}; "
+                      f"stop={actual_stop}; initialRisk={tracked['initial_risk']}; orderId={order_id}")
+                print(f"Position confirmed: {side} {position['size']} ETH at {actual_entry}; stop {actual_stop}.")
+                return
+            time.sleep(0.5)
+
+        event(self.db, "FORCE_ENTRY_FILL_NOT_YET_VISIBLE",
+              f"Bybit accepted orderId={order_id}, but position was not visible after 5s; inspect exchange before restarting bot.")
+        raise RuntimeError("Bybit accepted the order, but the position is not visible yet. Keep the strategy stopped and inspect Positions/Open Orders before restarting it.")
 
     def submit_signal(self, side: str, candle: Candle, atr: float, signal_ms: int) -> None:
         equity, available = self.api.account()
@@ -247,9 +410,17 @@ class LiveRunner:
         pending=get_state(self.db,"pending")
         tracked_position=get_state(self.db,"position")
         if positions is None and tracked_position is not None:
-            event(self.db,"LIVE_POSITION_CLOSED","Exchange reports the managed ETHUSDT position is flat; clearing local position state.")
+            origin = "forced" if tracked_position.get("forced") else "strategy"
+            closed_kind = "FORCED_POSITION_CLOSED" if tracked_position.get("forced") else "LIVE_POSITION_CLOSED"
+            event(self.db, closed_kind,
+                  f"Exchange reports position flat; origin={origin}; side={tracked_position.get('side')}; "
+                  f"entry={tracked_position.get('entry_price')}; qty={tracked_position.get('quantity')}; "
+                  f"last_stop={tracked_position.get('stop')}; exit_order_link_id={tracked_position.get('closing_order_link_id')}; "
+                  "exit may have been caused by the exchange stop or the recorded EMA close; confirm execution details in Bybit history.")
             set_state(self.db,"position",None)
             tracked_position=None
+        if pending and pending.get("submission_state") in ("SUBMITTING", "UNCONFIRMED"):
+            raise RuntimeError("An entry submission has an unclear result; inspect Bybit order/position history before resuming.")
         if len(fresh)>1:
             raise RuntimeError(f"{len(fresh)} hourly bars accumulated; live catch-up is disabled. Reconcile manually.")
         if positions is None and pending is None:
@@ -306,13 +477,32 @@ def main() -> None:
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config",default="live_config.json")
     parser.add_argument("--once",action="store_true")
+    parser.add_argument("--force-entry", choices=("LONG", "SHORT"),
+                        help="bypass the V6.1 signal and submit a confirmed market entry with ATR stop and equity-based sizing")
+    parser.add_argument("--history", action="store_true", help="print the latest persistent bot events from SQLite")
     args=parser.parse_args()
     logging.basicConfig(level=logging.INFO,format="%(asctime)s %(levelname)s %(message)s")
+    cfg=Config.load(args.config)
+    if args.history:
+        db=init_db(cfg.database_path, cfg.starting_balance_usd)
+        rows=db.execute("SELECT time,kind,detail FROM events ORDER BY id DESC LIMIT 100").fetchall()
+        if not rows:
+            print("No bot events recorded yet.")
+        else:
+            for row in reversed(rows):
+                print(f"{row['time']} | {row['kind']} | {row['detail']}")
+        return
     if os.getenv("LIVE_TRADING_ENABLED")!="YES":
         raise SystemExit("Live trading is disabled. Set LIVE_TRADING_ENABLED=YES in the protected service environment to enable order placement.")
-    cfg=Config.load(args.config)
+    if args.once and args.force_entry:
+        parser.error("--once and --force-entry cannot be used together")
+    if args.force_entry and live_service_is_active():
+        raise SystemExit("Stop bybit-ethusdt-live.service before a forced entry; two processes must not trade or write state at once.")
     api=BybitAPI(os.getenv("BYBIT_LIVE_API_KEY",""),os.getenv("BYBIT_LIVE_API_SECRET",""))
     runner=LiveRunner(cfg,api)
+    if args.force_entry:
+        runner.force_entry(args.force_entry)
+        return
     if args.once:
         runner.cycle()
         return

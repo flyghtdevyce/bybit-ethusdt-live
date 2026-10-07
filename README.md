@@ -1,6 +1,6 @@
 # Bybit ETHUSDT Strategy Lab V6.1 Live Bot
 
-Standalone repository and systemd service for real Bybit Linear ETHUSDT orders on closed 60-minute candles. Long and short trades are enabled. The strategy core is self-contained and mirrors the local V6.1 paper bot.
+Standalone repository and systemd service for real Bybit Linear ETHUSDT orders on closed 60-minute candles. Long and short trades are enabled. The strategy core is self-contained and mirrors the local V6.1 paper bot. Its mainnet state is stored separately in `data/live_mainnet.sqlite3`.
 
 ## Strategy settings
 
@@ -27,6 +27,29 @@ The signal and indicator rules mirror the local V6.1 paper implementation, inclu
 Create a Bybit HMAC API key for read and derivatives trading access, restrict it to the VPS IP, and leave withdrawal/transfer permissions disabled. Store it only in `/etc/bybit/ethusdt-live.env`, owned by `root:trader` with mode `0640`. Never commit credentials or put the Bybit key in GitHub Actions. The example environment file defaults `LIVE_TRADING_ENABLED=NO`.
 
 The live executor exits unless the protected VPS environment has the exact setting `LIVE_TRADING_ENABLED=YES`. Keep it `NO` while installing, reviewing, and testing. Starting balance $10,000 is only for historical replay; live sizing uses current account equity.
+
+## Forced entry
+
+`--force-entry LONG` or `--force-entry SHORT` bypasses signal and next-candle confirmation, then submits a market entry immediately with a stop attached at 0.5 of the latest closed H1 SMA-ATR. Quantity uses the configured risk percentage of current Unified equity, includes configured fee/slippage estimates, rounds down to Bybit's lot step, and observes the same available-margin cap as strategy entries. The resulting open position is recorded in the same SQLite state and then managed by the usual EMA exit and ATR trail. The command refuses existing ETHUSDT positions/orders or nonempty local bot state, requires an exact interactive confirmation, and refuses to run while the systemd strategy service is active. SQLite events record the sizing snapshot, order request/response, confirmed fill, stop, trail/exit events and when the position is no longer open; consult Bybit order/execution history for final fill and PnL details.
+
+Stop the service before invoking a forced entry, then load the protected environment in the current shell and run the command from the repository directory. After the command confirms the position and stop, restart the strategy service so it can manage the position:
+
+```sh
+set -e
+sudo systemctl stop bybit-ethusdt-live.service
+cd /home/trader/bybit-ethusdt-live
+set -a
+. /etc/bybit/ethusdt-live.env
+set +a
+python3 live_bot.py --config /home/trader/bybit-ethusdt-live/live_config.json --force-entry SHORT
+sudo systemctl start bybit-ethusdt-live.service
+```
+
+Replace `SHORT` with `LONG` if desired. Do not restart the service if the command reports an unclear submission or no confirmed position; inspect Bybit first. View the persistent SQLite event history with:
+
+```sh
+python3 live_bot.py --config /home/trader/bybit-ethusdt-live/live_config.json --history
+```
 
 ## VPS deployment
 
