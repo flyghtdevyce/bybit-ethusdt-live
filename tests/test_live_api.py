@@ -66,7 +66,7 @@ class LiveSafetyTests(unittest.TestCase):
         runner.qty_filter = {"qtyStep":"0.01", "minOrderQty":"0.01",
                              "minNotionalValue":"5", "maxMktOrderQty":"100000"}
         qty, stop_distance = runner.qty_for_risk("LONG", 100.0, 2.0, 20_000.0)
-        unit_risk = 1.0 + (100.0 + 99.0) * (0.00055 + 0.0002)
+        unit_risk = 1.0 + (100.0 + 99.0) * (0.001 + 0.0002)
         self.assertEqual(qty, "217.53")
         self.assertAlmostEqual(stop_distance, 1.0)
         self.assertAlmostEqual(float(qty), 250.0 / unit_risk, delta=0.01)
