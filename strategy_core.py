@@ -137,7 +137,7 @@ class Config:
     atr_stop_multiple: float = 0.5
     risk_per_trade_pct: float = 2.5
     breakout_buffer_pct: float = 1.0
-    fee_per_side_pct: float = 0.055
+    fee_per_side_pct: float = 0.1
     slippage_per_side_pct: float = 0.02
     starting_balance_usd: float = 10000.0
     trail_activation_r: float = 2.0
